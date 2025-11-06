@@ -28,39 +28,61 @@ def extract_drusen_from_zip(zip_path, data_dir):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             # Buscar archivos que contengan DRUSEN en el path
             drusen_files = [f for f in zip_ref.namelist() 
-                          if 'DRUSEN' in f and f.endswith(('.jpeg', '.jpg', '.png'))]
+                          if 'DRUSEN' in f.upper() and f.lower().endswith(('.jpeg', '.jpg', '.png'))]
             
             if not drusen_files:
                 print("❌ No se encontraron imágenes DRUSEN en el archivo zip")
+                print("\n🔍 Mostrando estructura del zip (primeros 20 archivos):")
+                for idx, name in enumerate(zip_ref.namelist()[:20]):
+                    print(f"  {name}")
+                if len(zip_ref.namelist()) > 20:
+                    print(f"  ... y {len(zip_ref.namelist()) - 20} archivos más")
                 return False
             
             print(f"📸 Encontradas {len(drusen_files)} imágenes DRUSEN")
+            print(f"📂 Destino: {data_dir}")
+            
+            # Crear directorio temporal
+            temp_dir = Path(__file__).parent / "temp"
             
             # Extraer solo los archivos DRUSEN
-            for file_path in drusen_files:
+            extracted_count = 0
+            for idx, file_path in enumerate(drusen_files):
                 # Obtener solo el nombre del archivo
                 filename = Path(file_path).name
                 
-                # Extraer a un directorio temporal
-                zip_ref.extract(file_path, path=Path(__file__).parent / "temp")
+                if not filename:  # Skip if it's a directory
+                    continue
                 
-                # Mover al directorio correcto
-                src = Path(__file__).parent / "temp" / file_path
-                dst = data_dir / filename
-                
-                if src.exists():
-                    shutil.move(str(src), str(dst))
+                try:
+                    # Extraer directamente al destino
+                    file_data = zip_ref.read(file_path)
+                    dst = data_dir / filename
+                    
+                    with open(dst, 'wb') as f:
+                        f.write(file_data)
+                    
+                    extracted_count += 1
+                    
+                    # Mostrar progreso cada 100 imágenes
+                    if (idx + 1) % 100 == 0:
+                        print(f"  Progreso: {idx + 1}/{len(drusen_files)} imágenes...")
+                        
+                except Exception as e:
+                    print(f"⚠️  Error al extraer {file_path}: {e}")
+                    continue
             
-            # Limpiar directorio temporal
-            temp_dir = Path(__file__).parent / "temp"
+            # Limpiar directorio temporal si existe
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
             
-            print(f"✅ {len(drusen_files)} imágenes extraídas exitosamente!")
-            return True
+            print(f"✅ {extracted_count} imágenes extraídas exitosamente!")
+            return extracted_count > 0
             
     except Exception as e:
         print(f"❌ Error al extraer: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def count_images(data_dir):
