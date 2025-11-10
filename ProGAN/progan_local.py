@@ -11,6 +11,8 @@ from pathlib import Path
 import cv2
 from math import log2
 from scipy.stats import truncnorm
+import signal
+import sys
 
 import torch
 import torch.nn as nn
@@ -53,21 +55,135 @@ ngpu = 1
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# GPU Safety settings for RTX 3070
+ENABLE_GPU_MONITORING = True
+MAX_BATCH_SIZE_LIMIT = 16  # Limitar batch size máximo para evitar sobrecalentamiento
+
 # Training config
 SAVE_MODEL = True
 LOAD_MODEL = False  # Set to True if you have pre-trained weights
 LEARNING_RATE = 1e-3
-BATCH_SIZES = [32, 32, 32, 16, 16, 16, 16, 8, 4]
+# Batch sizes optimizados para RTX 3070 (8GB VRAM)
+# Valores más conservadores para evitar sobrecalentamiento
+BATCH_SIZES = [16, 16, 12, 8, 6, 4, 3, 2, 1]  # Reducidos para tu RTX 3070
 CHANNELS_IMG = 3
 Z_DIM = 256  # Latent dimension
 IN_CHANNELS = 256
 CRITIC_ITERATIONS = 1
 LAMBDA_GP = 10
-PROGRESSIVE_EPOCHS = [30] * len(BATCH_SIZES)  # Epochs per resolution
+PROGRESSIVE_EPOCHS = [20] * len(BATCH_SIZES)  # Reducido de 30 a 20 épocas por resolución
 FIXED_NOISE = torch.randn(8, Z_DIM, 1, 1).to(device)
-NUM_WORKERS = 2
+NUM_WORKERS = 2  # Ajustado para mejor rendimiento
+
+# Gradient accumulation para simular batches más grandes sin usar tanta VRAM
+GRADIENT_ACCUMULATION_STEPS = 2  # Acumular gradientes cada 2 pasos
+
+# Guardado automático durante entrenamiento
+AUTO_SAVE_EVERY_N_BATCHES = 500  # Guardar cada 500 batches (ajusta según necesidad)
 
 # ==================== UTILS ====================
+
+# Variables globales para guardado de emergencia
+emergency_save_models = {}
+
+def setup_emergency_save(gen, critic, opt_gen, opt_critic):
+    """Configurar guardado de emergencia en caso de Ctrl+C"""
+    global emergency_save_models
+    emergency_save_models = {
+        'gen': gen,
+        'critic': critic,
+        'opt_gen': opt_gen,
+        'opt_critic': opt_critic
+    }
+    
+    def signal_handler(sig, frame):
+        print("\n\n" + "=" * 60)
+        print("🛑 ¡Ctrl+C detectado! Guardando pesos antes de salir...")
+        print("=" * 60)
+        
+        try:
+            # Guardar con timestamp para no sobrescribir
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            emergency_gen = str(WEIGHTS_DIR / f"EMERGENCY_generator_{timestamp}.pth")
+            emergency_critic = str(WEIGHTS_DIR / f"EMERGENCY_critic_{timestamp}.pth")
+            
+            save_checkpoint(emergency_save_models['gen'], 
+                          emergency_save_models['opt_gen'], 
+                          emergency_gen)
+            save_checkpoint(emergency_save_models['critic'], 
+                          emergency_save_models['opt_critic'], 
+                          emergency_critic)
+            
+            print(f"\n✅ Pesos guardados exitosamente:")
+            print(f"   📁 {emergency_gen}")
+            print(f"   📁 {emergency_critic}")
+            print("\n💡 Puedes reanudar el entrenamiento cargando estos pesos")
+            print("   Cambia CHECKPOINT_GEN y CHECKPOINT_CRITIC en el código")
+            print("=" * 60)
+        except Exception as e:
+            print(f"\n❌ Error al guardar: {e}")
+            print("⚠️  Los pesos NO se pudieron guardar")
+        
+        print("\n👋 Saliendo...")
+        sys.exit(0)
+    
+    # Registrar handler para Ctrl+C (SIGINT)
+    signal.signal(signal.SIGINT, signal_handler)
+    print("✅ Sistema de guardado de emergencia activado (Ctrl+C guardará pesos)")
+
+
+def get_gpu_stats():
+    """Obtener estadísticas de la GPU si está disponible"""
+    if torch.cuda.is_available():
+        try:
+            gpu_memory_allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
+            gpu_memory_reserved = torch.cuda.memory_reserved(0) / 1024**3  # GB
+            gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+            
+            # Intentar obtener temperatura (requiere nvidia-smi)
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=temperature.gpu,utilization.gpu,power.draw', 
+                     '--format=csv,noheader,nounits', '--id=0'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    temp, util, power = result.stdout.strip().split(',')
+                    return {
+                        'memory_allocated': f"{gpu_memory_allocated:.2f}GB",
+                        'memory_total': f"{gpu_memory_total:.2f}GB",
+                        'memory_percent': f"{(gpu_memory_allocated/gpu_memory_total)*100:.1f}%",
+                        'temperature': f"{temp}°C",
+                        'utilization': f"{util}%",
+                        'power': f"{power}W"
+                    }
+            except:
+                pass
+            
+            return {
+                'memory_allocated': f"{gpu_memory_allocated:.2f}GB",
+                'memory_total': f"{gpu_memory_total:.2f}GB",
+                'memory_percent': f"{(gpu_memory_allocated/gpu_memory_total)*100:.1f}%"
+            }
+        except:
+            return None
+    return None
+
+
+def print_gpu_stats():
+    """Imprimir estadísticas de GPU de forma legible"""
+    stats = get_gpu_stats()
+    if stats:
+        print("\n" + "=" * 50)
+        print("📊 Estadísticas de GPU:")
+        for key, value in stats.items():
+            print(f"  {key.replace('_', ' ').title()}: {value}")
+        print("=" * 50)
+
 
 def plot_to_tensorboard(writer, loss_critic, loss_gen, real, fake, tensorboard_step):
     """Plot losses and images to tensorboard"""
@@ -373,6 +489,11 @@ def train_fn(
     """Training function for one epoch"""
     loop = tqdm(loader, leave=True)
     
+    # Inicializar contadores para gradient accumulation
+    accumulated_loss_critic = 0
+    accumulated_loss_gen = 0
+    accumulation_counter = 0
+    
     for batch_idx, (real, _) in enumerate(loop):
         real = real.to(device)
         cur_batch_size = real.shape[0]
@@ -390,43 +511,70 @@ def train_fn(
                 + LAMBDA_GP * gp
                 + (0.001 * torch.mean(critic_real ** 2))
             )
+            # Normalizar por gradient accumulation
+            loss_critic = loss_critic / GRADIENT_ACCUMULATION_STEPS
 
-        opt_critic.zero_grad()
         scaler_critic.scale(loss_critic).backward()
-        scaler_critic.step(opt_critic)
-        scaler_critic.update()
+        accumulated_loss_critic += loss_critic.item()
+        
+        # Actualizar cada GRADIENT_ACCUMULATION_STEPS
+        if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+            scaler_critic.step(opt_critic)
+            scaler_critic.update()
+            opt_critic.zero_grad()
 
         # Train Generator
         with torch.cuda.amp.autocast():
             gen_fake = critic(fake, alpha, step)
             loss_gen = -torch.mean(gen_fake)
+            loss_gen = loss_gen / GRADIENT_ACCUMULATION_STEPS
 
-        opt_gen.zero_grad()
         scaler_gen.scale(loss_gen).backward()
-        scaler_gen.step(opt_gen)
-        scaler_gen.update()
+        accumulated_loss_gen += loss_gen.item()
+        
+        # Actualizar cada GRADIENT_ACCUMULATION_STEPS
+        if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+            scaler_gen.step(opt_gen)
+            scaler_gen.update()
+            opt_gen.zero_grad()
 
         # Update alpha
         alpha += cur_batch_size / ((PROGRESSIVE_EPOCHS[step] * 0.5) * len(dataset))
         alpha = min(alpha, 1)
 
-        # Log to tensorboard
-        if batch_idx % 10 == 0:
+        # 💾 GUARDADO AUTOMÁTICO cada N batches
+        if batch_idx > 0 and batch_idx % AUTO_SAVE_EVERY_N_BATCHES == 0:
+            print(f"\n💾 Auto-guardando checkpoint en batch {batch_idx}...")
+            save_checkpoint(gen, opt_gen, filename=CHECKPOINT_GEN_SAVE)
+            save_checkpoint(critic, opt_critic, filename=CHECKPOINT_CRITIC_SAVE)
+            print(f"✅ Checkpoint guardado")
+
+        # Log to tensorboard y mostrar stats de GPU
+        if batch_idx % 50 == 0:
             with torch.no_grad():
                 fixed_fakes = gen(FIXED_NOISE, alpha, step) * 0.5 + 0.5
             plot_to_tensorboard(
                 writer,
-                loss_critic.item(),
-                loss_gen.item(),
+                accumulated_loss_critic * GRADIENT_ACCUMULATION_STEPS,
+                accumulated_loss_gen * GRADIENT_ACCUMULATION_STEPS,
                 real.detach(),
                 fixed_fakes.detach(),
                 tensorboard_step,
             )
             tensorboard_step += 1
+            
+            # Mostrar estadísticas de GPU cada 50 batches
+            if ENABLE_GPU_MONITORING and batch_idx % 100 == 0:
+                print_gpu_stats()
+            
+            # Reset accumulated losses
+            accumulated_loss_critic = 0
+            accumulated_loss_gen = 0
 
         loop.set_postfix(
             gp=gp.item(),
-            loss_critic=loss_critic.item(),
+            loss_critic=(accumulated_loss_critic * GRADIENT_ACCUMULATION_STEPS),
+            alpha=f"{alpha:.3f}",
         )
 
     return tensorboard_step, alpha
@@ -440,8 +588,22 @@ def main():
     print("ProGAN Training - Local Version")
     print("=" * 50)
     print(f"Device: {device}")
-    print(f"Data directory: {DATA_DIR}")
-    print(f"Starting image size: {START_TRAIN_AT_IMG_SIZE}")
+    
+    # Verificar y mostrar información de GPU
+    if torch.cuda.is_available():
+        print(f"🎮 GPU Detectada: {torch.cuda.get_device_name(0)}")
+        print(f"💾 VRAM Total: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print(f"⚙️  CUDA Version: {torch.version.cuda}")
+        print_gpu_stats()
+    else:
+        print("⚠️  GPU no detectada - usando CPU")
+        print("\n🔧 Para usar tu RTX 3070, instala PyTorch con CUDA:")
+        print("   pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+        
+    print(f"\n📁 Data directory: {DATA_DIR}")
+    print(f"🖼️  Starting image size: {START_TRAIN_AT_IMG_SIZE}")
+    print(f"📦 Batch sizes optimizados para RTX 3070: {BATCH_SIZES}")
+    print(f"🔄 Gradient Accumulation Steps: {GRADIENT_ACCUMULATION_STEPS}")
     print("=" * 50)
     
     # Check if data directory exists
@@ -469,8 +631,11 @@ def main():
     # Initialize optimizers
     opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.99))
     opt_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.99))
-    scaler_critic = torch.cuda.amp.GradScaler()
-    scaler_gen = torch.cuda.amp.GradScaler()
+    scaler_critic = torch.amp.GradScaler('cuda')
+    scaler_gen = torch.amp.GradScaler('cuda')
+
+    # ⚠️ Configurar guardado de emergencia (Ctrl+C)
+    setup_emergency_save(gen, critic, opt_gen, opt_critic)
 
     # Tensorboard writer
     writer = SummaryWriter(str(LOGS_DIR))
@@ -506,6 +671,11 @@ def main():
 
         for epoch in range(num_epochs):
             print(f"\nEpoch [{epoch+1}/{num_epochs}]")
+            
+            # Mostrar stats de GPU al inicio de cada época
+            if ENABLE_GPU_MONITORING and torch.cuda.is_available():
+                print_gpu_stats()
+            
             tensorboard_step, alpha = train_fn(
                 critic, gen, loader, dataset, step, alpha,
                 opt_critic, opt_gen, tensorboard_step, writer,
@@ -515,6 +685,10 @@ def main():
             if SAVE_MODEL:
                 save_checkpoint(gen, opt_gen, filename=CHECKPOINT_GEN_SAVE)
                 save_checkpoint(critic, opt_critic, filename=CHECKPOINT_CRITIC_SAVE)
+            
+            # Limpiar caché de CUDA para evitar acumulación de memoria
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         step += 1
 
