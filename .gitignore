@@ -28,9 +28,7 @@ MANIFEST
 
 ProGAN/data/
 
-/out
-
-/data
+ProGAN/out
 
 ProGAN/archive.zip
 
