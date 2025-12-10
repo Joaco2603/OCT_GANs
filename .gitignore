@@ -30,6 +30,8 @@ ProGAN/data/
 
 /out
 
+/data
+
 ProGAN/archive.zip
 
 # PyInstaller
