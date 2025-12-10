@@ -28,6 +28,8 @@ MANIFEST
 
 ProGAN/data/
 
+/out
+
 ProGAN/archive.zip
 
 # PyInstaller
